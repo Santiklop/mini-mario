@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Mini Mario</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; display: flex; align-items: center; justify-content: center; font-family: monospace; color: #fff; }
+  canvas { background: #6bb6ff; image-rendering: pixelated; box-shadow: 0 0 24px #000; }
+  #hud { position: fixed; top: 12px; left: 50%; transform: translateX(-50%); font-size: 18px; letter-spacing: 2px; text-shadow: 2px 2px 0 #000; pointer-events: none; }
+  #msg { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 36px; text-shadow: 3px 3px 0 #000; text-align: center; display: none; }
+  #hint { position: fixed; bottom: 12px; left: 50%; transform: translateX(-50%); font-size: 12px; opacity: 0.7; }
+</style>
+</head>
+<body>
+<div id="hud">COINS: <span id="coins">0</span> &nbsp; LIVES: <span id="lives">3</span> &nbsp; WORLD 1-1</div>
+<div id="msg"></div>
+<div id="hint">← → or A/D to move &nbsp;·&nbsp; SPACE / ↑ / W to jump &nbsp;·&nbsp; R to restart</div>
+<canvas id="game" width="800" height="480"></canvas>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+const TILE = 32;
+
+// --- Level map ---
+// # = ground, B = brick, ? = question, | = pipe left, ! = pipe right, P = pipe top-left, O = pipe top-right
+// g = goomba, c = coin, F = flag, S = spawn
+const LEVEL = [
+  "                                                                                                        ",
+  "                                                                                                        ",
+  "                                                                                                        ",
+  "                                                                                                        ",
+  "                                                                                                        ",
+  "              ccc                                                                                       ",
+  "                                                                                                        ",
+  "                                                                                                        ",
+  "        B?B?B          c c c                                                    F                       ",
+  "                      BBBBBBB                                                   F                       ",
+  "                                                    c  c                        F                       ",
+  "                                                   BBBBBB                       F                       ",
+  "                          PO                                     c c                                    ",
+  "                          |!           PO                       BBBBB                                   ",
+  "  S                   g   |!    g  g   |!                                   g      g                   ",
+  "########################################################  #############  ##############################",
+  "########################################################  #############  ##############################",
+];
+
+const LEVEL_H = LEVEL.length;
+const LEVEL_W = Math.max(...LEVEL.map(r => r.length));
+const WORLD_H = LEVEL_H * TILE;
+const WORLD_W = LEVEL_W * TILE;
+
+// --- Entities ---
+let player, goombas, coins, bricks, questionBlocks, flagX, camera, state, coinsCollected, lives;
+
+function buildLevel() {
+  player = null;
+  goombas = [];
+  coins = [];
+  bricks = [];
+  questionBlocks = [];
+  flagX = 0;
+  for (let y = 0; y < LEVEL_H; y++) {
+    const row = LEVEL[y];
+    for (let x = 0; x < (row?.length || 0); x++) {
+      const ch = row[x];
+      const px = x * TILE, py = y * TILE;
+      if (ch === 'S') player = makePlayer(px, py);
+      else if (ch === 'g') goombas.push(makeGoomba(px, py));
+      else if (ch === 'c') coins.push({x: px+8, y: py+8, w: 16, h: 16, dead: false, anim: Math.random()*Math.PI*2});
+      else if (ch === 'B') bricks.push({x: px, y: py, w: TILE, h: TILE, broken: false});
+      else if (ch === '?') questionBlocks.push({x: px, y: py, w: TILE, h: TILE, used: false, bump: 0});
+      else if (ch === 'F') { if (!flagX) flagX = px + 8; }
+    }
+  }
+  if (!player) player = makePlayer(2*TILE, (LEVEL_H-4)*TILE);
+  camera = { x: 0 };
+  state = 'play';
+  coinsCollected = coinsCollected ?? 0;
+  lives = lives ?? 3;
+  updateHUD();
+}
+
+function makePlayer(x, y) {
+  return { x, y, w: 24, h: 30, vx: 0, vy: 0, onGround: false, facing: 1, walkFrame: 0, dead: false, invuln: 0 };
+}
+function makeGoomba(x, y) {
+  return { x: x+4, y: y+4, w: 24, h: 24, vx: -0.8, vy: 0, dead: false, squash: 0 };
+}
+
+// --- Solid tile check (ground + pipes) ---
+function solidAt(col, row) {
+  if (row < 0 || row >= LEVEL_H) return false;
+  const r = LEVEL[row];
+  if (!r || col < 0 || col >= r.length) return false;
+  const ch = r[col];
+  return ch === '#' || ch === '|' || ch === '!' || ch === 'P' || ch === 'O';
+}
+
+// Get all solids (tiles + bricks + question blocks) overlapping a rect — returns AABB objs
+function getSolids(x, y, w, h) {
+  const out = [];
+  const c0 = Math.floor(x / TILE), c1 = Math.floor((x + w - 1) / TILE);
+  const r0 = Math.floor(y / TILE), r1 = Math.floor((y + h - 1) / TILE);
+  for (let r = r0; r <= r1; r++) {
+    for (let c = c0; c <= c1; c++) {
+      if (solidAt(c, r)) out.push({x: c*TILE, y: r*TILE, w: TILE, h: TILE, kind: 'tile'});
+    }
+  }
+  for (const b of bricks) if (!b.broken && aabb(b, {x,y,w,h})) out.push({...b, kind: 'brick', ref: b});
+  for (const q of questionBlocks) if (aabb(q, {x,y,w,h})) out.push({...q, kind: 'question', ref: q});
+  return out;
+}
+
+function aabb(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// --- Input ---
+const keys = {};
+addEventListener('keydown', e => {
+  keys[e.key.toLowerCase()] = true;
+  if ([' ', 'ArrowUp', 'ArrowLeft', 'ArrowRight', 'ArrowDown'].includes(e.key)) e.preventDefault();
+  if (e.key.toLowerCase() === 'r') { coinsCollected = 0; lives = 3; buildLevel(); hideMsg(); }
+});
+addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+function left()  { return keys['arrowleft'] || keys['a']; }
+function right() { return keys['arrowright'] || keys['d']; }
+function jump()  { return keys[' '] || keys['arrowup'] || keys['w']; }
+
+// --- Physics ---
+const GRAV = 0.7;
+const MOVE = 0.6;
+const MAX_VX = 5;
+const JUMP_V = -13;
+const FRICTION = 0.82;
+
+function movePlayer() {
+  if (player.dead) return;
+  const accel = left() ? -MOVE : right() ? MOVE : 0;
+  player.vx += accel;
+  if (!accel && player.onGround) player.vx *= FRICTION;
+  player.vx = Math.max(-MAX_VX, Math.min(MAX_VX, player.vx));
+  if (Math.abs(player.vx) < 0.05) player.vx = 0;
+  if (player.vx !== 0) player.facing = player.vx > 0 ? 1 : -1;
+
+  if (jump() && player.onGround) {
+    player.vy = JUMP_V;
+    player.onGround = false;
+  }
+  // Variable jump height
+  if (!jump() && player.vy < -5) player.vy = -5;
+
+  player.vy += GRAV;
+  if (player.vy > 16) player.vy = 16;
+
+  // Horizontal move
+  player.x += player.vx;
+  let solids = getSolids(player.x, player.y, player.w, player.h);
+  for (const s of solids) {
+    if (aabb(s, player)) {
+      if (player.vx > 0) player.x = s.x - player.w;
+      else if (player.vx < 0) player.x = s.x + s.w;
+      player.vx = 0;
+    }
+  }
+
+  // Vertical move
+  player.y += player.vy;
+  player.onGround = false;
+  solids = getSolids(player.x, player.y, player.w, player.h);
+  for (const s of solids) {
+    if (aabb(s, player)) {
+      if (player.vy > 0) {
+        player.y = s.y - player.h;
+        player.onGround = true;
+        player.vy = 0;
+      } else if (player.vy < 0) {
+        player.y = s.y + s.h;
+        player.vy = 0;
+        // Bump blocks from below
+        if (s.kind === 'brick') { s.ref.broken = true; }
+        else if (s.kind === 'question' && !s.ref.used) {
+          s.ref.used = true;
+          s.ref.bump = 8;
+          coins.push({x: s.x+8, y: s.y-24, w: 16, h: 16, dead:false, anim: 0, spawnPop: 30, vy: -4});
+        }
+      }
+    }
+  }
+
+  // Walk anim
+  if (player.onGround && Math.abs(player.vx) > 0.5) player.walkFrame += Math.abs(player.vx)*0.2;
+
+  // Fall out of world
+  if (player.y > WORLD_H + 100) die();
+
+  // Reach flag
+  if (flagX && player.x + player.w >= flagX && player.x < flagX + 8) win();
+
+  if (player.invuln > 0) player.invuln--;
+}
+
+function moveGoombas() {
+  for (const g of goombas) {
+    if (g.dead) { g.squash++; continue; }
+    g.vy += GRAV;
+    if (g.vy > 12) g.vy = 12;
+
+    g.x += g.vx;
+    let solids = getSolids(g.x, g.y, g.w, g.h);
+    for (const s of solids) {
+      if (aabb(s, g)) {
+        if (g.vx > 0) g.x = s.x - g.w;
+        else g.x = s.x + s.w;
+        g.vx *= -1;
+      }
+    }
+
+    g.y += g.vy;
+    solids = getSolids(g.x, g.y, g.w, g.h);
+    let grounded = false;
+    for (const s of solids) {
+      if (aabb(s, g)) {
+        if (g.vy > 0) { g.y = s.y - g.h; g.vy = 0; grounded = true; }
+        else if (g.vy < 0) { g.y = s.y + s.h; g.vy = 0; }
+      }
+    }
+
+    // Edge detection — turn around at cliff
+    if (grounded) {
+      const aheadX = g.vx > 0 ? g.x + g.w + 1 : g.x - 1;
+      const belowY = g.y + g.h + 2;
+      const ahead = getSolids(aheadX, belowY, 1, 1);
+      if (ahead.length === 0) g.vx *= -1;
+    }
+
+    if (g.y > WORLD_H + 100) g.dead = true;
+  }
+  // Cull squashed
+  for (let i = goombas.length-1; i >= 0; i--) if (goombas[i].squash > 30) goombas.splice(i,1);
+}
+
+function checkInteractions() {
+  // Coins
+  for (const c of coins) {
+    if (c.dead) continue;
+    if (c.spawnPop !== undefined) {
+      c.spawnPop--;
+      c.y += c.vy;
+      c.vy += 0.4;
+      if (c.spawnPop <= 0) c.dead = true;
+      continue;
+    }
+    c.anim += 0.12;
+    if (!player.dead && aabb(c, player)) {
+      c.dead = true;
+      coinsCollected++;
+      updateHUD();
+    }
+  }
+  // Goombas
+  if (player.dead || player.invuln > 0) return;
+  for (const g of goombas) {
+    if (g.dead) continue;
+    if (aabb(g, player)) {
+      // Stomp if falling and player bottom is above goomba's mid
+      if (player.vy > 0 && player.y + player.h < g.y + g.h/2 + 4) {
+        g.dead = true;
+        player.vy = JUMP_V * 0.6;
+        coinsCollected += 1;
+        updateHUD();
+      } else {
+        die();
+      }
+    }
+  }
+}
+
+function die() {
+  if (player.dead) return;
+  player.dead = true;
+  player.vy = -10;
+  player.vx = 0;
+  lives--;
+  updateHUD();
+  setTimeout(() => {
+    if (lives <= 0) {
+      showMsg('GAME OVER\n<span style="font-size:18px">press R to restart</span>');
+      state = 'over';
+      coinsCollected = 0;
+      lives = 3;
+    } else {
+      buildLevel();
+      hideMsg();
+    }
+  }, 1500);
+}
+
+function win() {
+  if (state !== 'play') return;
+  state = 'won';
+  showMsg('YOU WIN!\n<span style="font-size:18px">press R to play again</span>');
+}
+
+// --- HUD / messages ---
+function updateHUD() {
+  document.getElementById('coins').textContent = coinsCollected;
+  document.getElementById('lives').textContent = Math.max(0, lives);
+}
+function showMsg(html) { const m = document.getElementById('msg'); m.innerHTML = html.replace(/\n/g,'<br>'); m.style.display = 'block'; }
+function hideMsg() { document.getElementById('msg').style.display = 'none'; }
+
+// --- Rendering ---
+function drawTileSprite(ch, x, y) {
+  if (ch === '#') {
+    ctx.fillStyle = '#c2783a';
+    ctx.fillRect(x, y, TILE, TILE);
+    ctx.fillStyle = '#8a4e1f';
+    ctx.fillRect(x, y, TILE, 4);
+    ctx.fillRect(x, y+TILE-4, TILE, 4);
+    ctx.fillRect(x+TILE/2-1, y, 2, TILE);
+  } else if (ch === '|' || ch === '!') {
+    ctx.fillStyle = '#2aa14a';
+    ctx.fillRect(x, y, TILE, TILE);
+    ctx.fillStyle = '#1c6b30';
+    ctx.fillRect(x, y, 4, TILE);
+    ctx.fillRect(x+TILE-4, y, 4, TILE);
+  } else if (ch === 'P' || ch === 'O') {
+    ctx.fillStyle = '#2aa14a';
+    ctx.fillRect(x-4, y, TILE+8, TILE);
+    ctx.fillStyle = '#1c6b30';
+    ctx.fillRect(x-4, y, 4, TILE);
+    ctx.fillRect(x+TILE, y, 4, TILE);
+    ctx.fillRect(x-4, y, TILE+8, 4);
+  }
+}
+
+function drawBrick(b) {
+  const x = b.x - camera.x, y = b.y;
+  ctx.fillStyle = '#c85a2c';
+  ctx.fillRect(x, y, b.w, b.h);
+  ctx.fillStyle = '#7a2c14';
+  ctx.fillRect(x, y, b.w, 3);
+  ctx.fillRect(x, y + b.h/2 - 1, b.w, 2);
+  ctx.fillRect(x, y + b.h - 3, b.w, 3);
+  ctx.fillRect(x + b.w/2 - 1, y, 2, b.h/2);
+  ctx.fillRect(x + b.w/4 - 1, y + b.h/2, 2, b.h/2);
+  ctx.fillRect(x + 3*b.w/4 - 1, y + b.h/2, 2, b.h/2);
+}
+
+function drawQuestion(q) {
+  const yOff = -q.bump;
+  if (q.bump > 0) q.bump -= 1;
+  const x = q.x - camera.x, y = q.y + yOff;
+  ctx.fillStyle = q.used ? '#8a6b20' : '#e6b84a';
+  ctx.fillRect(x, y, q.w, q.h);
+  ctx.fillStyle = q.used ? '#5a4514' : '#b58b2e';
+  ctx.fillRect(x, y, q.w, 3);
+  ctx.fillRect(x, y+q.h-3, q.w, 3);
+  ctx.fillRect(x, y, 3, q.h);
+  ctx.fillRect(x+q.w-3, y, 3, q.h);
+  if (!q.used) {
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 20px monospace';
+    ctx.fillText('?', x+q.w/2-6, y+q.h/2+7);
+  }
+}
+
+function drawCoin(c) {
+  const x = c.x - camera.x, y = c.y;
+  const stretch = Math.abs(Math.cos(c.anim));
+  ctx.fillStyle = '#ffd84a';
+  const cw = 16 * stretch;
+  ctx.fillRect(x + (16-cw)/2, y, cw, 16);
+  ctx.fillStyle = '#b58712';
+  ctx.fillRect(x + (16-cw)/2, y, cw, 2);
+  ctx.fillRect(x + (16-cw)/2, y + 14, cw, 2);
+}
+
+function drawGoomba(g) {
+  const x = g.x - camera.x, y = g.y;
+  if (g.dead) {
+    ctx.fillStyle = '#6b3a1a';
+    ctx.fillRect(x, y + g.h - 8, g.w, 8);
+    return;
+  }
+  ctx.fillStyle = '#6b3a1a';
+  ctx.fillRect(x+2, y+4, g.w-4, g.h-6);
+  ctx.fillStyle = '#3a1f0a';
+  ctx.fillRect(x, y+g.h-6, g.w, 6);
+  // feet
+  ctx.fillRect(x-1, y+g.h-3, 6, 3);
+  ctx.fillRect(x+g.w-5, y+g.h-3, 6, 3);
+  // eyes
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(x+6, y+8, 4, 5);
+  ctx.fillRect(x+14, y+8, 4, 5);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(x+8, y+10, 2, 3);
+  ctx.fillRect(x+16, y+10, 2, 3);
+}
+
+function drawPlayer() {
+  const x = Math.round(player.x - camera.x), y = Math.round(player.y);
+  if (player.invuln > 0 && Math.floor(player.invuln/3) % 2) return;
+  const w = player.w, h = player.h;
+  // Hat
+  ctx.fillStyle = '#d02020';
+  ctx.fillRect(x, y, w, 8);
+  ctx.fillRect(x + (player.facing>0?w-4:0), y+4, 8, 4);
+  // Face
+  ctx.fillStyle = '#ffcc99';
+  ctx.fillRect(x+2, y+8, w-4, 8);
+  // Eye
+  ctx.fillStyle = '#000';
+  ctx.fillRect(x + (player.facing>0 ? w-8 : 4), y+10, 2, 3);
+  // Mustache
+  ctx.fillRect(x+4, y+14, w-8, 2);
+  // Shirt
+  ctx.fillStyle = '#d02020';
+  ctx.fillRect(x, y+16, w, 6);
+  // Overalls
+  ctx.fillStyle = '#2a4fd0';
+  ctx.fillRect(x, y+22, w, h-22);
+  ctx.fillRect(x+4, y+16, 4, 8);
+  ctx.fillRect(x+w-8, y+16, 4, 8);
+  // Legs animation
+  const step = player.onGround ? Math.floor(player.walkFrame) % 2 : 1;
+  ctx.fillStyle = '#6b2010';
+  if (step === 0) {
+    ctx.fillRect(x, y+h-4, w/2, 4);
+    ctx.fillRect(x+w/2, y+h-4, w/2, 4);
+  } else {
+    ctx.fillRect(x-1, y+h-3, w/2+1, 3);
+    ctx.fillRect(x+w/2, y+h-3, w/2+1, 3);
+  }
+}
+
+function drawFlag() {
+  if (!flagX) return;
+  const x = flagX - camera.x;
+  // Find ground just below flag
+  const col = Math.floor(flagX/TILE);
+  let row = 0;
+  for (let r = 0; r < LEVEL_H; r++) if (solidAt(col, r)) { row = r; break; }
+  const top = (row - 6) * TILE;
+  const bottom = row * TILE;
+  ctx.fillStyle = '#ccc';
+  ctx.fillRect(x, top, 3, bottom - top);
+  ctx.fillStyle = '#ffcc33';
+  ctx.beginPath();
+  ctx.arc(x+1, top, 4, 0, Math.PI*2);
+  ctx.fill();
+  ctx.fillStyle = '#20a040';
+  ctx.beginPath();
+  ctx.moveTo(x+3, top+4);
+  ctx.lineTo(x+30, top+10);
+  ctx.lineTo(x+3, top+16);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawBackground() {
+  // Sky gradient
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#6bb6ff');
+  g.addColorStop(1, '#b8dfff');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // Clouds (parallax)
+  ctx.fillStyle = '#fff';
+  for (let i = 0; i < 20; i++) {
+    const cx = (i * 220 - camera.x * 0.3) % (WORLD_W + 400) - 100;
+    const cy = 60 + (i*37) % 120;
+    ctx.beginPath();
+    ctx.arc(cx, cy, 18, 0, Math.PI*2);
+    ctx.arc(cx+18, cy-6, 14, 0, Math.PI*2);
+    ctx.arc(cx+34, cy, 16, 0, Math.PI*2);
+    ctx.arc(cx+18, cy+6, 14, 0, Math.PI*2);
+    ctx.fill();
+  }
+  // Hills
+  ctx.fillStyle = '#3bb54a';
+  for (let i = 0; i < 14; i++) {
+    const hx = (i * 260 - camera.x * 0.6) % (WORLD_W + 400) - 100;
+    const hy = H - 80;
+    ctx.beginPath();
+    ctx.arc(hx, hy, 80, Math.PI, 0);
+    ctx.fill();
+  }
+}
+
+function render() {
+  drawBackground();
+  // Tiles
+  const c0 = Math.floor(camera.x / TILE) - 1;
+  const c1 = c0 + Math.ceil(W / TILE) + 2;
+  for (let r = 0; r < LEVEL_H; r++) {
+    const row = LEVEL[r];
+    if (!row) continue;
+    for (let c = Math.max(0, c0); c <= Math.min(row.length-1, c1); c++) {
+      const ch = row[c];
+      if (ch === '#' || ch === '|' || ch === '!' || ch === 'P' || ch === 'O') {
+        drawTileSprite(ch, c*TILE - camera.x, r*TILE);
+      }
+    }
+  }
+  for (const b of bricks) if (!b.broken) drawBrick(b);
+  for (const q of questionBlocks) drawQuestion(q);
+  drawFlag();
+  for (const c of coins) if (!c.dead) drawCoin(c);
+  for (const g of goombas) drawGoomba(g);
+  drawPlayer();
+}
+
+// --- Main loop ---
+function updateCamera() {
+  const target = player.x + player.w/2 - W/2;
+  camera.x = Math.max(0, Math.min(WORLD_W - W, target));
+}
+
+function frame() {
+  if (state === 'play') {
+    movePlayer();
+    moveGoombas();
+    checkInteractions();
+    updateCamera();
+  } else if (state === 'won' || state === 'over') {
+    // idle
+  }
+  render();
+  requestAnimationFrame(frame);
+}
+
+buildLevel();
+frame();
+</script>
+</body>
+</html>
